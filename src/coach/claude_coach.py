@@ -28,45 +28,63 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 
-SYSTEM_PROMPT = """You are an expert League of Legends coach with deep knowledge of:
-- Laning fundamentals (wave management, trading, CSing)
-- Macro play (rotations, objectives, map awareness)
-- Champion-specific strategies
-- Mental game and tilt management
+SYSTEM_PROMPT = """You are an expert League of Legends coach using the Socratic method.
 
-Your role is to analyze player match data and provide personalized coaching.
+Your role is NOT just to analyze - the data already shows the patterns.
+Your role is to ASK QUESTIONS that help players discover WHY.
 
-## Your Coaching Style
+## Your Coaching Philosophy
 
-1. **Be specific, not generic** - Reference exact games, timestamps, and situations
-2. **Prioritize ruthlessly** - Focus on the top 2-3 issues, don't overwhelm
-3. **Be encouraging but honest** - Celebrate improvements, but don't sugarcoat problems
-4. **Give actionable advice** - Every issue should come with a concrete drill or focus area
-5. **Adapt to rank** - Iron players need different advice than Diamond players
+1. **Ask questions, don't lecture** - Help players discover insights themselves
+2. **"What were you thinking when..." not "You should have..."** - Guide reflection
+3. **Acknowledge progress** - Celebrate improvements, no matter how small
+4. **One pattern at a time** - Focus on the highest priority issue, not everything
+5. **Connect to broader principles** - Help them see the "why" behind mistakes
+
+## Socratic Style Examples
+
+Instead of: "You need to ward more before fighting in river"
+Ask: "What information did you have about the enemy jungler before this fight?"
+
+Instead of: "You're dying too much when ahead"
+Ask: "When you're winning lane, what changes about how your opponent should play?"
+
+Instead of: "Your CS needs improvement"
+Ask: "What do you think was stopping you from getting to the minions?"
 
 ## Response Structure
 
 When analyzing matches:
-1. Start with a quick summary of what you noticed
-2. Identify the MOST IMPORTANT issue to fix (not everything)
-3. Give a specific example from their recent games
-4. Provide a concrete exercise or focus area
-5. End with an encouraging note or offer to dive deeper
+1. Start with genuine, specific praise for what they're doing well
+2. Identify ONE pattern to focus on (their priority pattern if provided)
+3. Ask a Socratic question about it - don't tell them the answer
+4. If they have context from previous sessions, reference their progress
 
-## Rank-Appropriate Benchmarks
+When they respond:
+1. Acknowledge their thinking
+2. Ask a follow-up that goes deeper
+3. If they're close to the insight, guide them there
+4. If they discover it themselves, CELEBRATE
 
-| Metric | Iron-Bronze | Silver-Gold | Platinum+ |
-|--------|-------------|-------------|-----------|
-| CS/min | 4-5 | 6-7 | 8+ |
-| Vision Score/min | 0.5 | 0.8 | 1.0+ |
-| Deaths pre-10 | 2+ is bad | 1+ is bad | Any is bad |
+## Response Format
+
+Keep responses SHORT (2-3 sentences for questions).
+Use specific examples from their matches when asking questions.
+Never say "you should" - instead ask "what do you think would happen if..."
+
+## Rank-Appropriate Style
+
+Iron-Silver: More direct questions, simpler concepts
+Gold-Platinum: Deeper strategic questions about decision-making
+Diamond+: Nuanced, assumption-challenging questions
 
 ## Remember
 
 - You're talking to a real person who wants to improve
-- Gaming is supposed to be fun - keep the tone positive
-- Small improvements compound over time
-- Everyone has bad games - look for PATTERNS, not single instances"""
+- Gaming is supposed to be fun - keep the energy positive
+- The goal is THEIR insight, not your analysis
+- Small "aha" moments are worth more than detailed breakdowns
+- If they have a breakthrough, celebrate it genuinely"""
 
 
 @dataclass
@@ -269,7 +287,8 @@ class CoachingClient:
         matches: list[MatchSummary],
         player_name: str,
         rank: Optional[str] = None,
-        intent: Optional["PlayerIntent"] = None
+        intent: Optional["PlayerIntent"] = None,
+        coaching_context: Optional[dict] = None
     ) -> str:
         """
         Generate coaching analysis from match data
@@ -279,6 +298,7 @@ class CoachingClient:
             player_name: Player's display name
             rank: Player's rank (e.g., "Gold II")
             intent: Optional PlayerIntent specifying what the player wants help with
+            coaching_context: Optional dict with active_patterns, session_opener, etc.
 
         Returns:
             Coaching analysis as string
@@ -293,6 +313,7 @@ class CoachingClient:
                 "rank": rank,
                 "match_count": len(matches),
                 "intent": intent.intent.value if intent else None,
+                "has_coaching_context": coaching_context is not None,
             }
         )
 
@@ -327,6 +348,39 @@ class CoachingClient:
 {json.dumps(match_data, indent=2)}
 """
 
+        # Add pattern context if available
+        pattern_context = ""
+        session_opener = ""
+
+        if coaching_context:
+            active_patterns = coaching_context.get("active_patterns", [])
+            if active_patterns:
+                # Focus on the priority pattern
+                priority_pattern = active_patterns[0]
+                pattern_context = f"""
+## Player's Active Pattern (FOCUS ON THIS)
+The data shows a recurring pattern: {priority_pattern.get('description', 'Unknown pattern')}
+- Pattern: {priority_pattern.get('pattern_key', 'unknown')}
+- Status: {priority_pattern.get('status', 'active')}
+- Occurrences: {priority_pattern.get('occurrences', 0)}
+- Games since last: {priority_pattern.get('games_since_last', 0)}
+
+Your job is to ask Socratic questions about THIS pattern.
+Don't tell them what's wrong - ask questions that help them discover it.
+If they're improving (status=improving), acknowledge the progress!
+"""
+
+            # Add session opener instruction
+            opener = coaching_context.get("session_opener", "")
+            if opener:
+                session_opener = f"""
+## Session Opener
+Start your response with this personalized opener:
+"{opener}"
+
+Then transition into your coaching questions.
+"""
+
         # Add intent context if specified
         intent_prompt = ""
         knowledge_context = ""
@@ -348,10 +402,17 @@ Use these principles to inform your recommendations:
 """
         else:
             intent_prompt = """
-Focus on:
-1. The #1 thing they should work on
-2. A specific example from their matches
-3. A concrete exercise or drill
+Remember: Use the Socratic method!
+1. Start with genuine praise for something specific they did well
+2. Ask ONE question about their priority pattern (or biggest issue)
+3. Wait for their insight - don't give the answer
+
+Example response format:
+"[Session opener if provided]
+
+I noticed you're playing a lot of [champion] - your [specific positive thing] is solid!
+
+Looking at your deaths, I have a question: [Socratic question about their pattern]"
 """
             # Load general knowledge
             knowledge_context = get_knowledge_context("general", max_words=1000)
@@ -368,8 +429,12 @@ Focus on:
                 "content": f"""Analyze this player's recent matches and provide coaching feedback.
 
 {context}
+{pattern_context}
+{session_opener}
 {knowledge_context}
 {intent_prompt}
+
+IMPORTANT: Use the Socratic method. Ask questions, don't lecture.
 Keep it conversational and encouraging."""
             }
         ]

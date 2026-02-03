@@ -16,6 +16,8 @@ from discord.ext import commands
 
 from ..logging_config import get_logger
 from ..config import get_config
+from ..db import get_database, close_database
+from ..db.repositories import PlayerRepository, PatternRepository
 from .voice import VoiceHandler
 from .missions import MissionTracker
 from .memory import PlayerMemory
@@ -175,6 +177,14 @@ class CoachBot(commands.Bot):
         @self.tree.command(name="progress", description="View your progress and stats")
         async def progress_command(interaction: discord.Interaction):
             await self._handle_progress_command(interaction)
+
+        @self.tree.command(name="review", description="Start a Socratic VOD review session")
+        async def review_command(interaction: discord.Interaction):
+            await self._handle_review_command(interaction)
+
+        @self.tree.command(name="patterns", description="View your detected patterns")
+        async def patterns_command(interaction: discord.Interaction):
+            await self._handle_patterns_command(interaction)
 
     async def _handle_coach_command(
         self,
@@ -762,6 +772,292 @@ class CoachBot(commands.Bot):
             )
 
         await interaction.response.send_message(embed=embed)
+
+    async def _handle_review_command(self, interaction: discord.Interaction):
+        """Handle /review command - start Socratic VOD review"""
+        await interaction.response.defer(thinking=True)
+
+        try:
+            from ..coach.vod_review import VODReviewManager
+
+            vod_manager = VODReviewManager()
+
+            # Get player ID from database
+            db = await get_database()
+            player_repo = PlayerRepository(db)
+            player = await player_repo.get_by_discord_id(interaction.user.id)
+
+            if not player:
+                await interaction.followup.send(
+                    "❌ No profile found. Start a coaching session with `/coach` first!",
+                    ephemeral=True
+                )
+                return
+
+            # Get reviewable deaths
+            moments = await vod_manager.get_reviewable_deaths(player["id"], limit=3)
+
+            if not moments:
+                await interaction.followup.send(
+                    "📭 No deaths to review yet!\n\n"
+                    "Play some games first, then I'll find moments worth reviewing together.",
+                    ephemeral=True
+                )
+                return
+
+            # Show options
+            embed = discord.Embed(
+                title="🎬 VOD Review - Choose a Moment",
+                description=(
+                    "Select a death to review together. I'll ask questions to help you "
+                    "discover what you could have done differently.\n\n"
+                    "**How it works:**\n"
+                    "1. Go to the timestamp in your replay\n"
+                    "2. I'll ask you a question about what happened\n"
+                    "3. Share your thoughts and we'll explore together"
+                ),
+                color=discord.Color.blue()
+            )
+
+            for i, moment in enumerate(moments):
+                pattern_tag = f" [{moment.pattern_key.replace('_', ' ')}]" if moment.pattern_key else ""
+                embed.add_field(
+                    name=f"{i+1}. ⏱️ {moment.timestamp_formatted} - {moment.killer_champion}{pattern_tag}",
+                    value=(
+                        f"**Context:** {moment.context}\n"
+                        f"**Question:** {moment.socratic_question}"
+                    ),
+                    inline=False
+                )
+
+            embed.set_footer(
+                text="Reply with the number (1, 2, or 3) to start reviewing that moment"
+            )
+
+            await interaction.followup.send(embed=embed)
+
+            # Store moments for follow-up (in a simple in-memory way for now)
+            # In production, you'd use a proper session store
+            if not hasattr(self, '_review_sessions'):
+                self._review_sessions = {}
+            self._review_sessions[interaction.user.id] = moments
+
+        except Exception as e:
+            logger.exception(f"Error in review command: {e}")
+            await interaction.followup.send(f"❌ Error: {str(e)}")
+
+    async def _handle_patterns_command(self, interaction: discord.Interaction):
+        """Handle /patterns command - show detected patterns"""
+        await interaction.response.defer(thinking=True)
+
+        try:
+            # Get pattern summary from memory
+            pattern_summary = await self.memory.get_pattern_summary(interaction.user.id)
+
+            embed = discord.Embed(
+                title="🔍 Your Detected Patterns",
+                description=(
+                    "These are recurring behaviors I've noticed in your gameplay.\n"
+                    "🔴 Active | 🟡 Improving | 🟢 Broken"
+                ),
+                color=discord.Color.purple()
+            )
+
+            embed.add_field(
+                name="Patterns",
+                value=pattern_summary,
+                inline=False
+            )
+
+            embed.add_field(
+                name="💡 What This Means",
+                value=(
+                    "**Active:** Still happening regularly\n"
+                    "**Improving:** Getting better (3+ games without)\n"
+                    "**Broken:** You've overcome this! (5+ games without)"
+                ),
+                inline=False
+            )
+
+            embed.set_footer(text="Use /review to work on these patterns with Socratic coaching")
+
+            await interaction.followup.send(embed=embed)
+
+        except Exception as e:
+            logger.exception(f"Error in patterns command: {e}")
+            await interaction.followup.send(f"❌ Error: {str(e)}")
+
+    async def _handle_coach_command_with_context(
+        self,
+        interaction: discord.Interaction,
+        riot_id: str,
+        platform: str,
+        focus: str
+    ):
+        """
+        Enhanced /coach command that includes pattern context and session continuity.
+        This replaces the original _handle_coach_command method.
+        """
+        await interaction.response.defer(thinking=True)
+
+        try:
+            self.coaching_channel = interaction.channel
+
+            from ..api.riot import RiotAPIClient
+            from ..coach.claude_coach import CoachingClient, extract_match_summary
+            from ..coach.intents import PlayerIntent, CoachingIntent
+
+            riot_client = RiotAPIClient()
+
+            await interaction.followup.send(f"🔍 Looking up **{riot_id}** on **{platform}**...")
+
+            if "#" not in riot_id:
+                await interaction.followup.send(
+                    "❌ Invalid Riot ID format. Use `Name#TAG` (e.g., `Player#BR1`)"
+                )
+                return
+
+            game_name, tag_line = riot_id.rsplit("#", 1)
+
+            account = await riot_client.get_account_by_riot_id(game_name, tag_line, platform)
+            matches = await riot_client.get_match_history(account["puuid"], platform, count=10)
+
+            if not matches:
+                await interaction.followup.send("❌ No recent matches found. Play some games first!")
+                return
+
+            summaries = []
+            for match_id in matches[:10]:
+                try:
+                    match_data = await riot_client.get_match(match_id, platform)
+                    summary = extract_match_summary(match_data, account["puuid"])
+                    summaries.append(summary)
+                except Exception as e:
+                    logger.warning(f"Failed to process match {match_id}: {e}")
+
+            if not summaries:
+                await interaction.followup.send("❌ Couldn't process any matches.")
+                return
+
+            intent = PlayerIntent(
+                intent=CoachingIntent(focus),
+                specific_champion=None,
+                specific_question=None
+            )
+
+            profile = self.memory.get_or_create_profile(
+                discord_id=interaction.user.id,
+                discord_name=interaction.user.display_name,
+                riot_id=riot_id,
+                platform=platform
+            )
+
+            self.memory.set_goal(interaction.user.id, focus, goal_type="current")
+
+            # Get coaching context with patterns and session opener
+            coaching_context = await self.memory.get_coaching_context(interaction.user.id)
+
+            coach = CoachingClient()
+
+            # Pass coaching context for Socratic, pattern-aware coaching
+            analysis = coach.analyze_matches(
+                matches=summaries,
+                player_name=game_name,
+                rank=profile.current_rank,
+                intent=intent,
+                coaching_context=coaching_context  # NEW: includes patterns, opener
+            )
+
+            # Generate mission - from pattern if available
+            db = await get_database()
+            player_repo = PlayerRepository(db)
+            pattern_repo = PatternRepository(db)
+
+            player = await player_repo.get_or_create(
+                interaction.user.id, riot_id, platform
+            )
+
+            priority_pattern = await pattern_repo.get_priority(player["id"])
+
+            if priority_pattern:
+                # Generate pattern-linked mission
+                mission = await self.mission_tracker.generate_mission_from_pattern(
+                    priority_pattern,
+                    player["id"],
+                    interaction.user.id
+                )
+            else:
+                # Fallback to regular mission
+                mission = await self.mission_tracker.generate_mission(
+                    analysis, focus, user_id=interaction.user.id
+                )
+
+            # Record session
+            await self.memory.record_session(
+                discord_id=interaction.user.id,
+                focus_area=focus,
+                matches_analyzed=len(summaries)
+            )
+
+            self.memory.add_coaching_note(
+                interaction.user.id,
+                f"Started session focusing on {focus}. Analyzed {len(summaries)} matches."
+            )
+
+            embed = discord.Embed(
+                title="🎮 Coaching Session Started",
+                description=analysis[:1000] + "..." if len(analysis) > 1000 else analysis,
+                color=discord.Color.blue()
+            )
+
+            # Add session opener if we have pattern progress
+            if coaching_context.get("session_opener"):
+                embed.insert_field_at(
+                    0,
+                    name="📊 Since Last Session",
+                    value=coaching_context["session_opener"],
+                    inline=False
+                )
+
+            # Show priority pattern if detected
+            if priority_pattern:
+                status_emoji = {
+                    "active": "🔴",
+                    "improving": "🟡",
+                    "broken": "🟢",
+                }.get(priority_pattern.get("status"), "⚪")
+
+                embed.add_field(
+                    name=f"{status_emoji} Focus Pattern",
+                    value=f"**{priority_pattern.get('pattern_key', '').replace('_', ' ').title()}**\n{priority_pattern.get('description', '')[:100]}",
+                    inline=False
+                )
+
+            embed.add_field(
+                name="📊 Your Rank",
+                value=f"**Current:** {profile.current_rank} → **Target:** {profile.target_rank}",
+                inline=False
+            )
+
+            embed.add_field(
+                name="📋 Your Mission",
+                value=mission[:500] if len(mission) > 500 else mission,
+                inline=False
+            )
+
+            embed.set_footer(text="Use /review to do Socratic VOD review | /patterns to see all patterns")
+
+            await interaction.followup.send(embed=embed)
+            logger.info(f"Started coaching session for {riot_id} (user {interaction.user.id})")
+
+        except Exception as e:
+            logger.exception(f"Error in coach command: {e}")
+            await interaction.followup.send(f"❌ Error: {str(e)}")
+
+    async def close(self):
+        """Clean up when bot is shutting down"""
+        await close_database()
+        await super().close()
 
 
 def run_bot():

@@ -4,6 +4,12 @@ LoL AI Coach - Player Analysis CLI
 
 Usage:
     python analyze_player.py "GameName#TAG" --region americas --matches 20
+
+Enhanced with:
+- Death extraction with full context
+- Pattern detection across games
+- Socratic coaching style
+- Session continuity
 """
 
 import os
@@ -20,6 +26,7 @@ from rich.console import Console
 from rich.markdown import Markdown
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.panel import Panel
+from rich.table import Table
 
 # Load environment before imports that use config
 load_dotenv()
@@ -35,6 +42,20 @@ from exceptions import (
     InvalidRiotIDError,
     InvalidPlatformError,
     InvalidMatchCountError,
+)
+from analysis.pattern_detector import (
+    extract_deaths_from_match,
+    detect_patterns,
+    check_pattern_status,
+    get_priority_pattern,
+)
+from db import get_database, close_database
+from db.repositories import (
+    PlayerRepository,
+    MatchRepository,
+    DeathRepository,
+    PatternRepository,
+    SessionRepository,
 )
 
 
@@ -56,10 +77,20 @@ async def analyze_player(
     match_count: int = 20,
     include_timeline: bool = True,
     intent: PlayerIntent = None,
-    interactive_intent: bool = True
+    interactive_intent: bool = True,
+    discord_id: int = 0
 ):
     """
-    Full player analysis pipeline
+    Full player analysis pipeline with database spine
+
+    NEW FLOW:
+    1. Fetch matches with timeline (existing)
+    2. Extract deaths with full context -> store in SQLite (NEW)
+    3. Run pattern detection -> update patterns table (NEW)
+    4. Check pattern status vs last session (NEW)
+    5. Generate session opener with continuity (NEW)
+    6. Analyze with Socratic prompts (UPDATED)
+    7. Offer VOD review or mission based on priority pattern (NEW)
 
     Args:
         riot_id: Player's Riot ID (Name#TAG)
@@ -68,6 +99,7 @@ async def analyze_player(
         include_timeline: Whether to fetch detailed timeline data
         intent: Optional pre-configured PlayerIntent
         interactive_intent: Whether to prompt for intent interactively
+        discord_id: Optional Discord user ID for database linking
     """
     # Generate correlation ID for this analysis session
     corr_id = generate_correlation_id()
@@ -157,7 +189,153 @@ async def analyze_player(
             if skipped > 0:
                 console.print(f"[yellow]Skipped {skipped} matches[/yellow]")
 
-            # Step 4: Generate coaching analysis
+            # Step 4: Initialize database and extract deaths
+            task = progress.add_task("Connecting to database...", total=None)
+            db = await get_database()
+            player_repo = PlayerRepository(db)
+            match_repo = MatchRepository(db)
+            death_repo = DeathRepository(db)
+            pattern_repo = PatternRepository(db)
+            session_repo = SessionRepository(db)
+            progress.update(task, completed=True)
+
+            # Get or create player in database
+            task = progress.add_task("Setting up player profile...", total=None)
+            player = await player_repo.get_or_create(
+                discord_id=discord_id,
+                riot_id=riot_id,
+                platform=platform
+            )
+            await player_repo.update_puuid(player["id"], puuid)
+            progress.update(task, completed=True)
+
+            # Step 5: Extract deaths with full context
+            task = progress.add_task("Extracting death context from timeline...", total=None)
+            all_deaths = []
+            matches_with_timeline = 0
+
+            for match in matches:
+                match_info = match.get("info", {})
+                match_id = match.get("metadata", {}).get("matchId", "unknown")
+
+                # Store match in database
+                db_match = await match_repo.get_or_create(
+                    match_id=match_id,
+                    player_id=player["id"],
+                    champion=next(
+                        (p["championName"] for p in match_info.get("participants", [])
+                         if p.get("puuid") == puuid),
+                        "Unknown"
+                    ),
+                    role=next(
+                        (p.get("teamPosition", "UNKNOWN") for p in match_info.get("participants", [])
+                         if p.get("puuid") == puuid),
+                        "UNKNOWN"
+                    ),
+                    win=next(
+                        (p.get("win", False) for p in match_info.get("participants", [])
+                         if p.get("puuid") == puuid),
+                        False
+                    ),
+                    kills=next(
+                        (p.get("kills", 0) for p in match_info.get("participants", [])
+                         if p.get("puuid") == puuid),
+                        0
+                    ),
+                    deaths=next(
+                        (p.get("deaths", 0) for p in match_info.get("participants", [])
+                         if p.get("puuid") == puuid),
+                        0
+                    ),
+                    assists=next(
+                        (p.get("assists", 0) for p in match_info.get("participants", [])
+                         if p.get("puuid") == puuid),
+                        0
+                    ),
+                    cs=next(
+                        (p.get("totalMinionsKilled", 0) + p.get("neutralMinionsKilled", 0)
+                         for p in match_info.get("participants", [])
+                         if p.get("puuid") == puuid),
+                        0
+                    ),
+                    vision_score=next(
+                        (p.get("visionScore", 0) for p in match_info.get("participants", [])
+                         if p.get("puuid") == puuid),
+                        0
+                    ),
+                    game_duration_sec=match_info.get("gameDuration", 0),
+                    played_at=None  # Could parse from gameStartTimestamp
+                )
+
+                # Extract deaths if timeline available
+                if "timeline" in match:
+                    matches_with_timeline += 1
+                    deaths = extract_deaths_from_match(match, match["timeline"], puuid)
+
+                    for death in deaths:
+                        death_data = death.to_dict()
+                        death_data["match_db_id"] = db_match["id"]
+                        death_data["player_id"] = player["id"]
+                        await death_repo.insert(death_data)
+                        all_deaths.append(death)
+
+            progress.update(task, completed=True)
+            console.print(f"[green]Extracted {len(all_deaths)} deaths from {matches_with_timeline} matches[/green]")
+
+            # Step 6: Detect patterns
+            task = progress.add_task("Detecting patterns...", total=None)
+            existing_patterns = await pattern_repo.get_all(player["id"])
+            pattern_updates = detect_patterns(all_deaths, existing_patterns)
+
+            for update in pattern_updates:
+                await pattern_repo.upsert(player["id"], update["pattern_key"], update)
+
+            # Update games_since_last for all patterns
+            await pattern_repo.increment_games_since(player["id"])
+
+            active_patterns = await pattern_repo.get_active(player["id"])
+            priority_pattern = get_priority_pattern(active_patterns)
+            progress.update(task, completed=True)
+
+            # Display patterns
+            if active_patterns:
+                console.print(f"\n[bold yellow]Detected Patterns:[/bold yellow]")
+                for p in active_patterns[:3]:
+                    status_emoji = {"active": "🔴", "improving": "🟡", "broken": "🟢"}.get(p.get("status"), "⚪")
+                    console.print(f"  {status_emoji} {p.get('pattern_key', '').replace('_', ' ').title()}: {p.get('description', '')[:60]}")
+
+            # Step 7: Get session opener
+            task = progress.add_task("Checking session history...", total=None)
+            last_session = await session_repo.get_last(player["id"])
+
+            session_opener = ""
+            if last_session:
+                focus = last_session.get("focus_area", "")
+                if focus:
+                    session_opener = f"Last time we talked about {focus}. "
+
+            if priority_pattern and priority_pattern.get("improvement_streak", 0) > 0:
+                session_opener += f"Your {priority_pattern.get('pattern_key', '').replace('_', ' ')} has been improving - {priority_pattern.get('improvement_streak')} games without triggering!"
+
+            progress.update(task, completed=True)
+
+            # Build coaching context
+            coaching_context = {
+                "active_patterns": active_patterns,
+                "pattern_progress": {
+                    p.get("pattern_key"): {
+                        "occurrences": p.get("occurrences", 0),
+                        "status": p.get("status"),
+                        "improvement_streak": p.get("improvement_streak", 0),
+                        "games_since_last": p.get("games_since_last", 0),
+                    }
+                    for p in active_patterns
+                },
+                "last_session": last_session,
+                "session_opener": session_opener,
+            }
+
+            # Step 8: Generate coaching analysis with Socratic prompts
             focus_msg = f"(focused on {intent.description})" if intent else ""
             task = progress.add_task(f"AI Coach analyzing your gameplay {focus_msg}...", total=None)
 
@@ -167,9 +345,17 @@ async def analyze_player(
                 matches=summaries,
                 player_name=f"{game_name}#{tag_line}",
                 rank=rank,
-                intent=intent
+                intent=intent,
+                coaching_context=coaching_context  # NEW: pattern-aware, Socratic
             )
             progress.update(task, completed=True)
+
+            # Record session
+            await session_repo.create(
+                player_id=player["id"],
+                focus_area=intent.intent.value if intent else "general",
+                matches_analyzed=len(summaries)
+            )
 
         # Display results
         console.print("\n")
@@ -267,6 +453,7 @@ async def analyze_player(
 
     finally:
         await riot_api.close()
+        await close_database()
 
 
 def main():
