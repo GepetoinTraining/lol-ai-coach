@@ -6,16 +6,28 @@ Acts as the coach's "memory" of each player - their rank, goals,
 progress, and coaching history.
 
 Each player gets their own .md file that the coach can read and update.
+
+Now integrates with database for:
+- Pattern tracking and progress
+- Session continuity with opener generation
+- Rich coaching context for AI prompts
 """
 
 import os
 import re
 from pathlib import Path
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Any
 from dataclasses import dataclass, field
 
 from ..logging_config import get_logger
+from ..db import get_database
+from ..db.repositories import (
+    PlayerRepository,
+    PatternRepository,
+    SessionRepository,
+    MissionRepository,
+)
 
 logger = get_logger(__name__)
 
@@ -396,3 +408,245 @@ class PlayerMemory:
             "Master": 29, "Grandmaster": 30, "Challenger": 31,
         }
         return ranks.get(rank, 0)
+
+    # ============================================================
+    # Database-Backed Coaching Context
+    # ============================================================
+
+    async def get_coaching_context(self, discord_id: int) -> dict[str, Any]:
+        """
+        Get full coaching context for AI prompts.
+
+        Combines:
+        - Markdown profile (goals, notes)
+        - Active patterns from DB
+        - Pattern progress
+        - Last session insights
+        - Generated session opener
+
+        Args:
+            discord_id: Discord user ID
+
+        Returns:
+            {
+                'profile': PlayerProfile,
+                'active_patterns': [...],
+                'pattern_progress': {...},
+                'last_session': {...},
+                'session_opener': str
+            }
+        """
+        # Load markdown profile
+        profile = self.load_profile(discord_id)
+        if not profile:
+            return {"profile": None}
+
+        # Get DB context
+        try:
+            db = await get_database()
+            player_repo = PlayerRepository(db)
+            pattern_repo = PatternRepository(db)
+            session_repo = SessionRepository(db)
+            mission_repo = MissionRepository(db)
+
+            player = await player_repo.get_by_discord_id(discord_id)
+            if not player:
+                return {"profile": profile}
+
+            player_id = player["id"]
+
+            # Get active patterns
+            active_patterns = await pattern_repo.get_active(player_id)
+
+            # Calculate progress for each pattern
+            pattern_progress = {}
+            for pattern in active_patterns:
+                pattern_progress[pattern["pattern_key"]] = {
+                    "occurrences": pattern.get("occurrences", 0),
+                    "status": pattern.get("status", "active"),
+                    "improvement_streak": pattern.get("improvement_streak", 0),
+                    "games_since_last": pattern.get("games_since_last", 0),
+                }
+
+            # Get last session
+            last_session = await session_repo.get_last(player_id)
+
+            # Generate session opener
+            session_opener = await self._generate_session_opener(
+                profile, active_patterns, last_session
+            )
+
+            return {
+                "profile": profile,
+                "active_patterns": active_patterns,
+                "pattern_progress": pattern_progress,
+                "last_session": last_session,
+                "session_opener": session_opener,
+            }
+
+        except Exception as e:
+            logger.exception(f"Error getting coaching context: {e}")
+            return {"profile": profile}
+
+    async def _generate_session_opener(
+        self,
+        profile: PlayerProfile,
+        active_patterns: list[dict],
+        last_session: Optional[dict]
+    ) -> str:
+        """
+        Generate personalized session opener based on continuity.
+
+        Examples:
+        - "Last time you said you'd focus on warding river. You've played 2 games since - let's see how it went!"
+        - "Welcome back! Your early deaths have decreased - nice progress!"
+        - "Good to see you again. You mentioned wanting to work on your CS - want to continue with that?"
+        """
+        opener_parts = []
+
+        # Reference last session if exists
+        if last_session:
+            try:
+                last_started = last_session.get("started_at")
+                if last_started:
+                    if isinstance(last_started, str):
+                        last_date = datetime.fromisoformat(last_started.replace("Z", "+00:00"))
+                    else:
+                        last_date = last_started
+
+                    days_since = (datetime.now() - last_date.replace(tzinfo=None)).days
+
+                    if days_since < 7:
+                        focus = last_session.get("focus_area", "")
+                        if focus:
+                            opener_parts.append(
+                                f"Welcome back! Last time we talked about {focus}."
+                            )
+            except Exception as e:
+                logger.warning(f"Could not parse last session date: {e}")
+
+        # Highlight pattern progress
+        improving_patterns = [p for p in active_patterns if p.get("status") == "improving"]
+        if improving_patterns:
+            pattern = improving_patterns[0]
+            pattern_name = pattern.get("pattern_key", "").replace("_", " ")
+            streak = pattern.get("improvement_streak", 0)
+            if streak > 0:
+                opener_parts.append(
+                    f"Your {pattern_name} has been improving - "
+                    f"{streak} games without triggering!"
+                )
+
+        # Reference broken patterns (successes!)
+        broken_patterns = [p for p in active_patterns if p.get("status") == "broken"]
+        if broken_patterns:
+            pattern = broken_patterns[0]
+            pattern_name = pattern.get("pattern_key", "").replace("_", " ")
+            opener_parts.append(
+                f"Great news: You've broken the {pattern_name} pattern! "
+                f"It hasn't shown up in your recent games."
+            )
+
+        # Reference player goals
+        if profile.current_goal and profile.current_goal != "Improve overall gameplay":
+            opener_parts.append(f"Still working towards: {profile.current_goal}")
+
+        # Default opener if nothing else
+        if not opener_parts:
+            if profile.sessions_count > 1:
+                opener_parts.append("Good to see you again! Ready for some coaching?")
+            else:
+                opener_parts.append("Let's take a look at your gameplay!")
+
+        return " ".join(opener_parts)
+
+    async def record_session(
+        self,
+        discord_id: int,
+        focus_area: str,
+        patterns_discussed: Optional[list[str]] = None,
+        insights: Optional[list[str]] = None,
+        matches_analyzed: int = 0
+    ) -> Optional[int]:
+        """
+        Record a coaching session for continuity.
+
+        Args:
+            discord_id: Discord user ID
+            focus_area: What the session focused on
+            patterns_discussed: Pattern keys that were discussed
+            insights: Insights generated during the session
+            matches_analyzed: Number of matches analyzed
+
+        Returns:
+            Session ID or None if failed
+        """
+        try:
+            db = await get_database()
+            player_repo = PlayerRepository(db)
+            session_repo = SessionRepository(db)
+
+            player = await player_repo.get_by_discord_id(discord_id)
+            if not player:
+                return None
+
+            session_id = await session_repo.create(
+                player_id=player["id"],
+                focus_area=focus_area,
+                matches_analyzed=matches_analyzed
+            )
+
+            # If we have patterns/insights to record, end the session immediately
+            # with that info (for simple use cases)
+            if patterns_discussed or insights:
+                await session_repo.end_session(
+                    session_id=session_id,
+                    patterns_discussed=patterns_discussed,
+                    insights=insights
+                )
+
+            logger.info(f"Recorded session {session_id} for discord_id={discord_id}")
+            return session_id
+
+        except Exception as e:
+            logger.exception(f"Error recording session: {e}")
+            return None
+
+    async def get_pattern_summary(self, discord_id: int) -> str:
+        """
+        Get a summary of the player's patterns for display.
+
+        Returns a formatted string suitable for Discord embeds.
+        """
+        try:
+            db = await get_database()
+            player_repo = PlayerRepository(db)
+            pattern_repo = PatternRepository(db)
+
+            player = await player_repo.get_by_discord_id(discord_id)
+            if not player:
+                return "No patterns tracked yet."
+
+            patterns = await pattern_repo.get_all(player["id"])
+            if not patterns:
+                return "No patterns detected yet. Play some games!"
+
+            lines = []
+            for p in patterns[:5]:  # Top 5 patterns
+                status_emoji = {
+                    "active": "🔴",
+                    "improving": "🟡",
+                    "broken": "🟢",
+                }.get(p.get("status"), "⚪")
+
+                name = p.get("pattern_key", "").replace("_", " ").title()
+                occurrences = p.get("occurrences", 0)
+                status = p.get("status", "active")
+
+                lines.append(f"{status_emoji} **{name}** ({occurrences}x) - {status}")
+
+            return "\n".join(lines)
+
+        except Exception as e:
+            logger.exception(f"Error getting pattern summary: {e}")
+            return "Could not load pattern summary."

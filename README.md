@@ -13,6 +13,9 @@ This is **NOT** another stats tracker. While apps like Blitz, Mobalytics, and Po
 - **Talks to you like a real coach** would
 - **Voice-enabled Discord bot** with in-game overlay missions
 - **Screenshot analysis** to verify your progress
+- **Database-backed pattern tracking** that remembers across sessions
+- **Socratic coaching method** that asks questions instead of lecturing
+- **VOD review system** to analyze specific deaths with context
 
 ## Example Interaction
 
@@ -122,6 +125,8 @@ python scripts/run_discord_bot.py
 | `/mission` | Show current mission |
 | `/check` | Upload screenshot to verify progress |
 | `/complete` | Mark mission as complete |
+| `/patterns` | View your detected patterns and status |
+| `/review` | Start a Socratic VOD review session |
 
 ### Voice Commands
 
@@ -145,6 +150,36 @@ You speak → Whisper transcribes → Coach understands
     You upload screenshot → Claude Vision analyzes
                     ↓
         Progress feedback in overlay
+```
+
+### Pattern Detection Flow
+
+```
+Match Timeline → Death Extraction → Pattern Detection → Mission Generation
+       ↓                ↓                  ↓                    ↓
+   Riot API      Position, wards,    Clustering by        "0 river deaths
+                 gold diff, etc.     location/time         this game"
+                        ↓                  ↓                    ↓
+                   Database         Status Tracking      Auto-Verification
+                   Storage       (active→improving→broken)
+```
+
+### Socratic VOD Review
+
+The `/review` command walks you through deaths using the Socratic method:
+
+```
+Coach: "At 7:23, you died in river to their jungler. You were 300g ahead.
+        What information did you have about where their jungler was?"
+
+You:   "I didn't check the map..."
+
+Coach: "Good awareness. What could you check before walking into river?"
+
+You:   "I could look at which lanes have pressure, or if my jungler pinged"
+
+Coach: "Exactly! When your lanes don't have pressure, the enemy jungler
+        is more likely to be in your area. That's a great insight!"
 ```
 
 ## CLI Usage
@@ -203,6 +238,26 @@ docker-compose run coach "PlayerName#TAG" --platform br1
 - RAG knowledge base with coaching theory
 - Interactive follow-up conversations
 
+### Pattern Detection & Memory
+- **Death extraction** with full context (position, ward state, gold diff)
+- **7 pattern types** automatically detected:
+  - `river_death_no_ward` - Dying in river without vision
+  - `dies_when_ahead` - Throwing leads
+  - `early_death_repeat` - Consistent early deaths
+  - `caught_sidelane` - Getting caught while splitting
+  - `tower_dive_death` - Failed tower dives
+  - `teamfight_positioning` - Bad teamfight positioning
+  - `objective_death` - Deaths during objective fights
+- **Pattern status tracking**: Active → Improving → Broken
+- **Session continuity**: "Last time you focused on X, you've improved!"
+- **Pattern-linked missions**: Missions target YOUR failure patterns
+
+### Socratic VOD Review
+- **Reviews specific deaths** with full context
+- **Asks questions instead of lecturing**: "What information did you have about their jungler?"
+- **Detects breakthroughs**: Celebrates "aha" moments
+- **Tracks player responses** for learning progress
+
 ### Production Infrastructure
 - Structured logging (JSON for production, colored for dev)
 - Comprehensive error handling with retry logic
@@ -219,10 +274,21 @@ lol-ai-coach/
 ├── src/
 │   ├── api/              # Riot API client
 │   │   └── riot.py       # Rate-limited API calls
+│   ├── analysis/         # Pattern detection
+│   │   └── pattern_detector.py  # Death extraction & patterns
 │   ├── coach/            # AI coaching logic
-│   │   ├── claude_coach.py   # Claude integration
+│   │   ├── claude_coach.py   # Claude integration (Socratic)
 │   │   ├── intents.py        # Player intent system
-│   │   └── knowledge.py      # RAG knowledge loader
+│   │   ├── knowledge.py      # RAG knowledge loader
+│   │   └── vod_review.py     # Socratic VOD review
+│   ├── db/               # Database layer
+│   │   ├── database.py       # Async SQLite connection
+│   │   ├── repositories.py   # Data access layer
+│   │   └── schema.sql        # Table definitions
+│   ├── discord_bot/      # Discord integration
+│   │   ├── bot.py            # Slash commands
+│   │   ├── memory.py         # Player memory & context
+│   │   └── missions.py       # Pattern-linked missions
 │   ├── config.py         # Configuration management
 │   ├── exceptions.py     # Custom exceptions
 │   ├── logging_config.py # Structured logging

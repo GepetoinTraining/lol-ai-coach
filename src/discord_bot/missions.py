@@ -3,13 +3,14 @@ Mission Tracker for LoL AI Coach
 
 Handles:
 - Mission generation based on coaching analysis
-- Mission state tracking per user
+- Pattern-linked mission generation
+- Mission state tracking per user (with database persistence)
 - Screenshot analysis for mission verification
 - Progress tracking and tips
 """
 
 import base64
-from typing import Optional, TYPE_CHECKING
+from typing import Optional, Any, TYPE_CHECKING
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -18,11 +19,103 @@ import anthropic
 
 from ..logging_config import get_logger
 from ..config import get_config
+from ..db import get_database
+from ..db.repositories import MissionRepository, PatternRepository, PlayerRepository
+from ..analysis.pattern_detector import PatternKey, DeathContext
 
 if TYPE_CHECKING:
     from .bot import CoachBot
 
 logger = get_logger(__name__)
+
+
+# Pattern-specific mission templates
+PATTERN_MISSION_TEMPLATES = {
+    PatternKey.RIVER_DEATH_NO_WARD.value: {
+        "name": "The Ward Guardian",
+        "description": (
+            "Your mission: Place a ward in river before making ANY aggressive play. "
+            "If you don't see a ward, you don't fight. River is where junglers live - "
+            "respect their territory."
+        ),
+        "success_criteria": "Zero deaths in river zones this game",
+        "tips": [
+            "Count to 3 after placing ward - if no one shows, THEN you can play aggressive",
+            "If you don't know where their jungler is, assume they're in the closest bush",
+        ],
+        "focus_area": "vision",
+    },
+    PatternKey.DIES_WHEN_AHEAD.value: {
+        "name": "The Patient Hunter",
+        "description": (
+            "You're winning lane, but then throwing leads. Your mission: When you're ahead, "
+            "play SAFER, not more aggressive. Being ahead means you can farm safely - "
+            "let THEM make mistakes coming to you."
+        ),
+        "success_criteria": "Don't die while ahead in gold (500+ lead)",
+        "tips": [
+            "Being ahead means they HAVE to fight you, so just farm",
+            "A 500 gold lead grows to 1000 gold if you just don't die",
+        ],
+        "focus_area": "trading",
+    },
+    PatternKey.EARLY_DEATH_REPEAT.value: {
+        "name": "The Slow Starter",
+        "description": (
+            "You're dying too early in games. Your mission: Survive the first 10 minutes. "
+            "Early deaths snowball - the jungler you fed will come back for more. "
+            "Play like a coward until you hit your power spike."
+        ),
+        "success_criteria": "Zero deaths before 10:00",
+        "tips": [
+            "If you don't have vision, you don't have permission to push",
+            "Play like their jungler started on your side",
+        ],
+        "focus_area": "laning",
+    },
+    PatternKey.CAUGHT_SIDELANE.value: {
+        "name": "The Map Reader",
+        "description": (
+            "You're getting caught while sidelaning. Your mission: Before pushing past river, "
+            "count the enemies on the map. If you can't see 3+ enemies, you can't push. "
+            "The wave isn't worth your life."
+        ),
+        "success_criteria": "Don't die while alone in a sidelane",
+        "tips": [
+            "Before pushing, ask: 'Where are the 3 enemies I can't see?'",
+            "Deep wards save lives - ward their jungle, not yours",
+        ],
+        "focus_area": "macro",
+    },
+    PatternKey.TOWER_DIVE_FAIL.value: {
+        "name": "The Tower Respecter",
+        "description": (
+            "Tower dives are killing you. Your mission: Don't dive unless you KNOW "
+            "they can't survive the burst. Calculate tower shots. Watch their summoners. "
+            "A failed dive is worse than no dive."
+        ),
+        "success_criteria": "Zero deaths under enemy tower",
+        "tips": [
+            "Count tower shots: Level 1-7 towers hurt, 8+ you can tank one",
+            "Never dive if their CC is up",
+        ],
+        "focus_area": "trading",
+    },
+    PatternKey.OVEREXTEND_NO_VISION.value: {
+        "name": "The Vision Hunter",
+        "description": (
+            "You're dying in the dark. Your mission: Ward before you walk. "
+            "Every time you want to push forward, place a ward first. "
+            "If you can't ward it, you can't walk there."
+        ),
+        "success_criteria": "Don't die in unwarded territory",
+        "tips": [
+            "Rule of thumb: 1 ward = 1 minute of safe play",
+            "Control wards are an investment, not an expense",
+        ],
+        "focus_area": "vision",
+    },
+}
 
 
 class MissionStatus(Enum):
@@ -71,17 +164,36 @@ class MissionTracker:
     - Generating contextual missions
     - Analyzing screenshots to check progress
     - Providing tips based on game state
+
+    Now supports:
+    - Database persistence for missions
+    - Pattern-linked mission generation
+    - Mission verification against match data
     """
 
     def __init__(self, bot: "CoachBot"):
         self.bot = bot
         self.config = get_config()
-        self.sessions: dict[int, UserSession] = {}
+        self.sessions: dict[int, UserSession] = {}  # In-memory cache
 
         # Initialize Claude client
         self.claude = anthropic.Anthropic()
 
+        # Database repositories (initialized lazily)
+        self._db = None
+        self._mission_repo: Optional[MissionRepository] = None
+        self._pattern_repo: Optional[PatternRepository] = None
+        self._player_repo: Optional[PlayerRepository] = None
+
         logger.info("MissionTracker initialized")
+
+    async def _init_repos(self):
+        """Lazily initialize database repositories."""
+        if self._db is None:
+            self._db = await get_database()
+            self._mission_repo = MissionRepository(self._db)
+            self._pattern_repo = PatternRepository(self._db)
+            self._player_repo = PlayerRepository(self._db)
 
     def get_session(self, user_id: int) -> Optional[UserSession]:
         """Get user's coaching session"""
@@ -433,3 +545,254 @@ Be specific and actionable.
         except Exception as e:
             logger.exception(f"Error answering question: {e}")
             return "Sorry, I couldn't process that. Try asking again!"
+
+    # ============================================================
+    # Pattern-Linked Missions
+    # ============================================================
+
+    async def generate_mission_from_pattern(
+        self,
+        pattern: dict[str, Any],
+        player_id: int,
+        discord_id: int
+    ) -> str:
+        """
+        Generate a mission specifically targeting a detected pattern.
+
+        Uses predefined templates for known patterns with personalization.
+
+        Args:
+            pattern: Pattern dict from database
+            player_id: Database player ID
+            discord_id: Discord user ID for session tracking
+
+        Returns:
+            Mission description text
+        """
+        await self._init_repos()
+
+        pattern_key = pattern.get("pattern_key")
+        template = PATTERN_MISSION_TEMPLATES.get(pattern_key)
+
+        if template:
+            # Use template-based mission
+            mission_text = self._format_pattern_mission(template, pattern)
+            success_criteria = template["success_criteria"]
+            tips = template["tips"]
+            focus_area = template["focus_area"]
+        else:
+            # Generate custom mission via Claude for unknown patterns
+            mission_text = await self._generate_custom_pattern_mission(pattern)
+            success_criteria = "Complete the mission objective"
+            tips = ["Focus on breaking this habit"]
+            focus_area = pattern.get("pattern_category", "general")
+
+        # Store in database
+        mission_id = await self._mission_repo.create({
+            "player_id": player_id,
+            "pattern_id": pattern.get("id"),
+            "description": mission_text,
+            "focus_area": focus_area,
+            "success_criteria": success_criteria,
+            "tips": tips,
+        })
+
+        # Also update in-memory session
+        mission = Mission(
+            id=str(mission_id),
+            description=mission_text,
+            focus_area=focus_area,
+            success_criteria=success_criteria,
+            tips=tips,
+        )
+
+        if discord_id not in self.sessions:
+            self.sessions[discord_id] = UserSession(
+                user_id=discord_id,
+                analysis="",
+                focus=focus_area,
+            )
+
+        self.sessions[discord_id].missions.append(mission)
+        self.sessions[discord_id].current_mission_idx = len(self.sessions[discord_id].missions) - 1
+
+        logger.info(
+            f"Generated pattern mission for player {player_id}: "
+            f"{pattern_key} -> {template['name'] if template else 'custom'}"
+        )
+
+        return mission_text
+
+    def _format_pattern_mission(
+        self,
+        template: dict[str, Any],
+        pattern: dict[str, Any]
+    ) -> str:
+        """Format a pattern mission template with personalization."""
+        occurrences = pattern.get("occurrences", 0)
+        status = pattern.get("status", "active")
+
+        # Build the mission text
+        mission_text = f"🎯 **{template['name']}**\n\n"
+        mission_text += template["description"]
+
+        # Add pattern context
+        if occurrences > 3:
+            mission_text += f"\n\n📊 *This has happened {occurrences} times in your recent games.*"
+
+        if status == "improving":
+            mission_text += "\n\n✨ *You've been improving on this - keep it up!*"
+
+        mission_text += f"\n\n✅ **Success:** {template['success_criteria']}"
+        mission_text += f"\n\n💡 **Pro tip:** {template['tips'][0]}"
+
+        return mission_text
+
+    async def _generate_custom_pattern_mission(self, pattern: dict[str, Any]) -> str:
+        """Generate a custom mission for patterns without templates."""
+        pattern_key = pattern.get("pattern_key", "unknown")
+        description = pattern.get("description", "a recurring issue")
+        occurrences = pattern.get("occurrences", 0)
+
+        prompt = f"""You are a League of Legends coach creating a mission to break a bad habit.
+
+PATTERN: {pattern_key}
+DESCRIPTION: {description}
+OCCURRENCES: {occurrences} times in recent games
+
+Create a FUN, MEMORABLE mission that:
+1. Directly addresses this pattern
+2. Is achievable in one game
+3. Has a catchy name
+4. Explains WHY this matters
+
+Format:
+🎯 **[Mission Name]**
+[2-3 sentences describing the mission]
+
+✅ **Success:** [Clear success criteria]
+
+💡 **Pro tip:** [One actionable tip]
+"""
+
+        try:
+            response = self.claude.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=400,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            return response.content[0].text
+
+        except Exception as e:
+            logger.exception(f"Error generating custom pattern mission: {e}")
+            return (
+                f"🎯 **Break the Habit**\n\n"
+                f"Focus on avoiding: {description}\n\n"
+                f"✅ **Success:** Don't trigger this pattern this game\n\n"
+                f"💡 **Pro tip:** Awareness is the first step to change!"
+            )
+
+    async def check_mission_against_match(
+        self,
+        mission_id: int,
+        match_deaths: list[DeathContext]
+    ) -> dict[str, Any]:
+        """
+        Check if a pattern-linked mission was completed in a match.
+
+        Args:
+            mission_id: Database ID of the mission
+            match_deaths: Deaths from the match to evaluate
+
+        Returns:
+            {
+                'completed': bool,
+                'notes': str,
+                'progress': str
+            }
+        """
+        await self._init_repos()
+
+        mission = await self._mission_repo.get_by_id(mission_id)
+        if not mission:
+            return {
+                "completed": False,
+                "notes": "Mission not found",
+                "progress": "Unknown"
+            }
+
+        pattern_id = mission.get("pattern_id")
+        if not pattern_id:
+            # Not a pattern-linked mission, can't auto-check
+            return {
+                "completed": False,
+                "notes": "Manual verification required",
+                "progress": "Check your game stats"
+            }
+
+        pattern = await self._pattern_repo.get_by_key(
+            mission.get("player_id"),
+            ""  # Need to get by ID instead
+        )
+
+        # For now, look up pattern from mission
+        # Check if pattern was triggered in this match
+        pattern_triggered = self._check_pattern_in_deaths(
+            mission.get("pattern_id"),
+            match_deaths
+        )
+
+        if pattern_triggered:
+            return {
+                "completed": False,
+                "notes": "Pattern was triggered in this game",
+                "progress": "Keep trying! You'll break this habit."
+            }
+        else:
+            # Mission completed!
+            await self._mission_repo.complete(
+                mission_id,
+                notes="Pattern not triggered - mission success!"
+            )
+            return {
+                "completed": True,
+                "notes": "Pattern NOT triggered - great job!",
+                "progress": "Mission complete! The pattern didn't show up this game."
+            }
+
+    def _check_pattern_in_deaths(
+        self,
+        pattern_id: int,
+        deaths: list[DeathContext]
+    ) -> bool:
+        """Check if a pattern was triggered in the given deaths."""
+        # This is a simplified check - in reality we'd look up the pattern
+        # and check against specific criteria
+        # For now, any death could trigger the pattern
+        return len(deaths) > 0
+
+    async def get_active_mission_from_db(self, discord_id: int) -> Optional[dict[str, Any]]:
+        """Get active mission from database."""
+        await self._init_repos()
+
+        player = await self._player_repo.get_by_discord_id(discord_id)
+        if not player:
+            return None
+
+        return await self._mission_repo.get_active(player["id"])
+
+    async def get_mission_stats(self, discord_id: int) -> dict[str, int]:
+        """Get mission statistics for a player."""
+        await self._init_repos()
+
+        player = await self._player_repo.get_by_discord_id(discord_id)
+        if not player:
+            return {"completed": 0, "total": 0}
+
+        completed = await self._mission_repo.count_completed(player["id"])
+        history = await self._mission_repo.get_history(player["id"])
+
+        return {
+            "completed": completed,
+            "total": len(history),
+        }
