@@ -11,6 +11,8 @@ from dataclasses import dataclass
 
 import anthropic
 
+from .knowledge import get_knowledge_context
+
 
 SYSTEM_PROMPT = """You are an expert League of Legends coach with deep knowledge of:
 - Laning fundamentals (wave management, trading, CSing)
@@ -193,11 +195,22 @@ class CoachingClient:
         
         # Add intent context if specified
         intent_prompt = ""
+        knowledge_context = ""
+        
         if intent:
             intent_prompt = f"""
 {intent.to_prompt_context()}
 
 Focus your analysis specifically on what the player asked for help with.
+"""
+            # Load relevant knowledge for this intent
+            knowledge_context = get_knowledge_context(intent.intent.value, max_words=1500)
+            if knowledge_context:
+                knowledge_context = f"""
+## Coaching Knowledge Base (Core Theory)
+Use these principles to inform your recommendations:
+
+{knowledge_context}
 """
         else:
             intent_prompt = """
@@ -205,6 +218,13 @@ Focus on:
 1. The #1 thing they should work on
 2. A specific example from their matches
 3. A concrete exercise or drill
+"""
+            # Load general knowledge
+            knowledge_context = get_knowledge_context("general", max_words=1000)
+            if knowledge_context:
+                knowledge_context = f"""
+## Coaching Knowledge Base
+{knowledge_context}
 """
         
         # Generate analysis
@@ -218,6 +238,7 @@ Focus on:
                     "content": f"""Analyze this player's recent matches and provide coaching feedback.
 
 {context}
+{knowledge_context}
 {intent_prompt}
 Keep it conversational and encouraging."""
                 }
