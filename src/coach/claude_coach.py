@@ -6,12 +6,26 @@ Handles AI-powered coaching conversations and analysis using Anthropic's Claude 
 
 import os
 import json
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 from dataclasses import dataclass
 
 import anthropic
+from tenacity import (
+    retry,
+    stop_after_attempt,
+    wait_exponential,
+    retry_if_exception_type,
+    before_sleep_log,
+)
 
 from .knowledge import get_knowledge_context
+from ..logging_config import get_logger
+from ..exceptions import ClaudeAPIError
+
+if TYPE_CHECKING:
+    from .intents import PlayerIntent
+
+logger = get_logger(__name__)
 
 
 SYSTEM_PROMPT = """You are an expert League of Legends coach with deep knowledge of:
@@ -70,7 +84,7 @@ class MatchSummary:
     damage_dealt: int
     game_duration_min: int
     death_times: list[int]  # Timestamps of deaths in seconds
-    
+
     def to_dict(self) -> dict:
         return {
             "champion": self.champion,
@@ -89,7 +103,7 @@ class MatchSummary:
 def extract_match_summary(match_data: dict, puuid: str) -> MatchSummary:
     """Extract relevant coaching data from a match"""
     info = match_data["info"]
-    
+
     # Find this player
     participant = None
     participant_id = None
@@ -98,10 +112,10 @@ def extract_match_summary(match_data: dict, puuid: str) -> MatchSummary:
             participant = p
             participant_id = p["participantId"]
             break
-    
+
     if not participant:
         raise ValueError("Player not found in match")
-    
+
     # Get death times from timeline if available
     death_times = []
     if "timeline" in match_data:
@@ -109,10 +123,10 @@ def extract_match_summary(match_data: dict, puuid: str) -> MatchSummary:
             for event in frame.get("events", []):
                 if event.get("type") == "CHAMPION_KILL" and event.get("victimId") == participant_id:
                     death_times.append(event["timestamp"] // 1000)  # Convert to seconds
-    
+
     game_duration = info["gameDuration"]
     total_cs = participant["totalMinionsKilled"] + participant.get("neutralMinionsKilled", 0)
-    
+
     return MatchSummary(
         champion=participant["championName"],
         role=participant.get("teamPosition", "UNKNOWN"),
@@ -129,24 +143,127 @@ def extract_match_summary(match_data: dict, puuid: str) -> MatchSummary:
     )
 
 
+def _should_retry_claude_error(exception: BaseException) -> bool:
+    """Determine if we should retry based on exception type"""
+    if isinstance(exception, anthropic.RateLimitError):
+        return True
+    if isinstance(exception, anthropic.APIConnectionError):
+        return True
+    if isinstance(exception, anthropic.APIStatusError):
+        # Retry on server errors and overloaded
+        return exception.status_code in (500, 502, 503, 529)
+    return False
+
+
 class CoachingClient:
     """
     AI Coaching client using Claude
-    
+
     Usage:
         coach = CoachingClient()
-        analysis = await coach.analyze_matches(summaries, player_info)
-        response = await coach.chat(analysis, "How can I improve my CSing?")
+        analysis = coach.analyze_matches(summaries, player_info)
+        response = coach.chat(analysis, "How can I improve my CSing?")
     """
-    
-    def __init__(self, api_key: Optional[str] = None):
+
+    def __init__(self, api_key: Optional[str] = None, model: Optional[str] = None):
         self.api_key = api_key or os.getenv("ANTHROPIC_API_KEY")
         if not self.api_key:
             raise ValueError("ANTHROPIC_API_KEY is required")
-        
+
         self.client = anthropic.Anthropic(api_key=self.api_key)
-        self.model = "claude-sonnet-4-20250514"
-    
+        self.model = model or os.getenv("CLAUDE_MODEL", "claude-sonnet-4-20250514")
+
+        logger.info(f"CoachingClient initialized with model: {self.model}")
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=30),
+        retry=retry_if_exception_type((
+            anthropic.RateLimitError,
+            anthropic.APIConnectionError,
+        )),
+        reraise=True,
+    )
+    def _call_claude(
+        self,
+        messages: list[dict],
+        max_tokens: int,
+        operation: str = "api_call"
+    ) -> str:
+        """
+        Make a Claude API call with retry logic and error handling.
+
+        Args:
+            messages: Message list for the API
+            max_tokens: Maximum tokens in response
+            operation: Name of the operation for logging
+
+        Returns:
+            Response text from Claude
+
+        Raises:
+            ClaudeAPIError: On API failures after retries exhausted
+        """
+        logger.debug(
+            f"Calling Claude API for {operation}",
+            extra={"model": self.model, "max_tokens": max_tokens, "message_count": len(messages)}
+        )
+
+        try:
+            response = self.client.messages.create(
+                model=self.model,
+                max_tokens=max_tokens,
+                system=SYSTEM_PROMPT,
+                messages=messages
+            )
+
+            logger.info(
+                f"Claude API {operation} completed",
+                extra={
+                    "input_tokens": response.usage.input_tokens,
+                    "output_tokens": response.usage.output_tokens,
+                    "operation": operation,
+                }
+            )
+
+            return response.content[0].text
+
+        except anthropic.AuthenticationError as e:
+            logger.error(f"Claude API authentication failed: {e}")
+            raise ClaudeAPIError.authentication_failed()
+
+        except anthropic.RateLimitError as e:
+            logger.warning(f"Claude API rate limited: {e}")
+            raise ClaudeAPIError.rate_limited()
+
+        except anthropic.BadRequestError as e:
+            logger.error(f"Claude API bad request: {e}")
+            error_str = str(e).lower()
+            if "context" in error_str or "token" in error_str:
+                raise ClaudeAPIError.context_too_long()
+            raise ClaudeAPIError.invalid_request(str(e))
+
+        except anthropic.APIStatusError as e:
+            logger.error(f"Claude API status error: {e.status_code} - {e}")
+            if e.status_code == 529:
+                raise ClaudeAPIError.overloaded()
+            raise ClaudeAPIError(
+                f"Claude API error (HTTP {e.status_code})",
+                status_code=e.status_code
+            )
+
+        except anthropic.APIConnectionError as e:
+            logger.error(f"Claude API connection failed: {e}")
+            raise ClaudeAPIError.connection_failed()
+
+        except anthropic.APITimeoutError as e:
+            logger.error(f"Claude API timeout: {e}")
+            raise ClaudeAPIError.timeout()
+
+        except Exception as e:
+            logger.exception(f"Unexpected error in Claude API call: {e}")
+            raise ClaudeAPIError(f"Unexpected error: {str(e)}")
+
     def analyze_matches(
         self,
         matches: list[MatchSummary],
@@ -156,26 +273,43 @@ class CoachingClient:
     ) -> str:
         """
         Generate coaching analysis from match data
-        
+
         Args:
             matches: List of MatchSummary objects
             player_name: Player's display name
             rank: Player's rank (e.g., "Gold II")
             intent: Optional PlayerIntent specifying what the player wants help with
-        
+
         Returns:
             Coaching analysis as string
+
+        Raises:
+            ClaudeAPIError: On API failures
         """
+        logger.info(
+            f"Starting match analysis",
+            extra={
+                "player_name": player_name[:10] + "...",
+                "rank": rank,
+                "match_count": len(matches),
+                "intent": intent.intent.value if intent else None,
+            }
+        )
+
         # Prepare match data for the prompt
         match_data = [m.to_dict() for m in matches]
-        
+
         # Calculate aggregate stats
         total_games = len(matches)
+        if total_games == 0:
+            logger.warning("No matches to analyze")
+            return "I don't see any match data to analyze. Let's try fetching your recent games again!"
+
         wins = sum(1 for m in matches if m.win)
-        avg_cs_per_min = sum(m.cs_per_min for m in matches) / total_games if total_games > 0 else 0
-        avg_vision = sum(m.vision_score for m in matches) / total_games if total_games > 0 else 0
+        avg_cs_per_min = sum(m.cs_per_min for m in matches) / total_games
+        avg_vision = sum(m.vision_score for m in matches) / total_games
         total_early_deaths = sum(len([t for t in m.death_times if t < 600]) for m in matches)
-        
+
         # Build context
         context = f"""
 ## Player Information
@@ -192,11 +326,11 @@ class CoachingClient:
 ## Match Details
 {json.dumps(match_data, indent=2)}
 """
-        
+
         # Add intent context if specified
         intent_prompt = ""
         knowledge_context = ""
-        
+
         if intent:
             intent_prompt = f"""
 {intent.to_prompt_context()}
@@ -226,27 +360,22 @@ Focus on:
 ## Coaching Knowledge Base
 {knowledge_context}
 """
-        
+
         # Generate analysis
-        response = self.client.messages.create(
-            model=self.model,
-            max_tokens=1500,
-            system=SYSTEM_PROMPT,
-            messages=[
-                {
-                    "role": "user",
-                    "content": f"""Analyze this player's recent matches and provide coaching feedback.
+        messages = [
+            {
+                "role": "user",
+                "content": f"""Analyze this player's recent matches and provide coaching feedback.
 
 {context}
 {knowledge_context}
 {intent_prompt}
 Keep it conversational and encouraging."""
-                }
-            ]
-        )
-        
-        return response.content[0].text
-    
+            }
+        ]
+
+        return self._call_claude(messages, max_tokens=1500, operation="analyze_matches")
+
     def chat(
         self,
         player_context: str,
@@ -255,17 +384,25 @@ Keep it conversational and encouraging."""
     ) -> str:
         """
         Continue a coaching conversation
-        
+
         Args:
             player_context: The initial analysis context
             user_message: User's new message
             conversation_history: Previous messages in the conversation
-        
+
         Returns:
             Coach's response
+
+        Raises:
+            ClaudeAPIError: On API failures
         """
+        logger.debug(
+            "Processing chat message",
+            extra={"history_length": len(conversation_history) if conversation_history else 0}
+        )
+
         messages = []
-        
+
         # Add initial context
         messages.append({
             "role": "user",
@@ -275,26 +412,19 @@ Keep it conversational and encouraging."""
             "role": "assistant",
             "content": "I've reviewed your matches. What would you like to focus on?"
         })
-        
+
         # Add conversation history
         if conversation_history:
             messages.extend(conversation_history)
-        
+
         # Add new message
         messages.append({
             "role": "user",
             "content": user_message
         })
-        
-        response = self.client.messages.create(
-            model=self.model,
-            max_tokens=1000,
-            system=SYSTEM_PROMPT,
-            messages=messages
-        )
-        
-        return response.content[0].text
-    
+
+        return self._call_claude(messages, max_tokens=1000, operation="chat")
+
     def generate_exercise(
         self,
         weakness: str,
@@ -303,15 +433,23 @@ Keep it conversational and encouraging."""
     ) -> str:
         """
         Generate a specific practice exercise
-        
+
         Args:
             weakness: The identified weakness to address
             rank: Player's rank
             main_champions: Champions they play most
-        
+
         Returns:
             Detailed exercise description
+
+        Raises:
+            ClaudeAPIError: On API failures
         """
+        logger.info(
+            "Generating exercise",
+            extra={"weakness": weakness[:50], "rank": rank, "champion_count": len(main_champions)}
+        )
+
         prompt = f"""Create a specific practice exercise for a {rank} player who struggles with:
 
 {weakness}
@@ -332,14 +470,9 @@ Format:
 **Success Metric:** [How to know it's working]
 **Common Mistakes:** [What to watch out for]"""
 
-        response = self.client.messages.create(
-            model=self.model,
-            max_tokens=800,
-            system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": prompt}]
-        )
-        
-        return response.content[0].text
+        messages = [{"role": "user", "content": prompt}]
+
+        return self._call_claude(messages, max_tokens=800, operation="generate_exercise")
 
 
 # ==================== CLI for testing ====================
@@ -348,9 +481,9 @@ def main():
     """Test the coaching client with sample data"""
     from rich.console import Console
     from rich.markdown import Markdown
-    
+
     console = Console()
-    
+
     # Sample match data
     sample_matches = [
         MatchSummary(
@@ -396,31 +529,37 @@ def main():
             death_times=[210, 380, 520, 680, 850, 1000, 1200, 1400, 1600]  # 4 early deaths
         ),
     ]
-    
-    console.print("\n[bold]🎮 LoL AI Coach - Test Run[/bold]\n")
-    
-    coach = CoachingClient()
-    
-    # Generate analysis
-    console.print("[yellow]Analyzing matches...[/yellow]\n")
-    
-    analysis = coach.analyze_matches(
-        matches=sample_matches,
-        player_name="TestPlayer",
-        rank="Silver II"
-    )
-    
-    console.print(Markdown(analysis))
-    
-    # Test follow-up
-    console.print("\n[yellow]Testing follow-up question...[/yellow]\n")
-    
-    follow_up = coach.chat(
-        player_context=analysis,
-        user_message="Can you give me a specific drill to work on my early game deaths?"
-    )
-    
-    console.print(Markdown(follow_up))
+
+    console.print("\n[bold]LoL AI Coach - Test Run[/bold]\n")
+
+    try:
+        coach = CoachingClient()
+
+        # Generate analysis
+        console.print("[yellow]Analyzing matches...[/yellow]\n")
+
+        analysis = coach.analyze_matches(
+            matches=sample_matches,
+            player_name="TestPlayer",
+            rank="Silver II"
+        )
+
+        console.print(Markdown(analysis))
+
+        # Test follow-up
+        console.print("\n[yellow]Testing follow-up question...[/yellow]\n")
+
+        follow_up = coach.chat(
+            player_context=analysis,
+            user_message="Can you give me a specific drill to work on my early game deaths?"
+        )
+
+        console.print(Markdown(follow_up))
+
+    except ClaudeAPIError as e:
+        console.print(f"\n[red]Claude API Error: {e.message}[/red]")
+    except Exception as e:
+        console.print(f"\n[red]Error: {e}[/red]")
 
 
 if __name__ == "__main__":

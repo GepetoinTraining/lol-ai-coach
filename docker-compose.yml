@@ -1,0 +1,98 @@
+# Docker Compose configuration for LoL AI Coach
+#
+# Usage:
+#   docker-compose up coach              # Run CLI interactively
+#   docker-compose --profile api up      # Run with API server
+#   docker-compose --profile with-redis up  # Run with Redis
+
+version: '3.8'
+
+services:
+  # ==================== Main CLI Application ====================
+  coach:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: lol-coach
+    env_file:
+      - .env
+    environment:
+      - APP_ENV=production
+      - LOG_LEVEL=INFO
+    volumes:
+      - ./data:/app/data
+      - ./knowledge:/app/knowledge:ro
+    stdin_open: true
+    tty: true
+    # Override command to analyze a player (set PLAYER_ID in .env)
+    # command: ["${PLAYER_ID:-Player#TAG}", "--platform", "${PLATFORM:-br1}"]
+
+  # ==================== Optional: Redis for Rate Limiting ====================
+  redis:
+    image: redis:7-alpine
+    container_name: lol-coach-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    profiles:
+      - with-redis
+      - api
+
+  # ==================== Optional: API Server (Future) ====================
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: lol-coach-api
+    entrypoint: ["python", "-m", "uvicorn"]
+    command: ["src.api:app", "--host", "0.0.0.0", "--port", "8000"]
+    env_file:
+      - .env
+    environment:
+      - APP_ENV=production
+      - LOG_LEVEL=INFO
+      - REDIS_URL=redis://redis:6379
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+      - ./knowledge:/app/knowledge:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    profiles:
+      - api
+
+  # ==================== Development: Run Tests ====================
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: lol-coach-test
+    entrypoint: ["python", "-m", "pytest"]
+    command: ["tests/", "-v", "--cov=src", "--cov-report=term-missing"]
+    environment:
+      - APP_ENV=development
+      - RIOT_API_KEY=RGAPI-test-key
+      - ANTHROPIC_API_KEY=sk-ant-test-key
+    volumes:
+      - ./tests:/app/tests:ro
+      - ./src:/app/src:ro
+    profiles:
+      - test
+
+volumes:
+  redis-data:
+    driver: local
