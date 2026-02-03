@@ -1,4 +1,4 @@
-# LoL AI Coach 🎮🤖
+# LoL AI Coach
 
 An AI-powered coaching system for League of Legends that analyzes your match history and provides personalized improvement recommendations.
 
@@ -9,34 +9,37 @@ This is **NOT** another stats tracker. While apps like Blitz, Mobalytics, and Po
 - **Understands your patterns** across multiple matches
 - **Identifies your specific weaknesses** with concrete examples
 - **Creates personalized drills** to address your issues
-- **Tracks your improvement** over time
+- **Focuses on what you want** with the intent system
 - **Talks to you like a real coach** would
 
 ## Example Interaction
 
 ```
-> analyze "PlayerName#BR1"
+> python scripts/analyze_player.py "PlayerName#BR1" --platform br1
 
-🔍 Analyzing last 20 matches for PlayerName#BR1...
+What would you like to focus on today?
+1. Laning - CS, trading, wave management
+2. Macro - Rotations, objectives, map awareness
+3. Dying Less - Survivability and positioning
+...
 
-📊 Found some patterns:
+You: 1
 
-You died before 10 minutes in 14 of your last 20 games, averaging 2.1 early 
-deaths per game. Looking at the timeline data, most of these deaths happen 
+Analyzing last 20 matches for PlayerName#BR1...
+
+Found some patterns:
+
+You died before 10 minutes in 14 of your last 20 games, averaging 2.1 early
+deaths per game. Looking at the timeline data, most of these deaths happen
 between 6-8 minutes when you're pushed up without vision.
 
-In your Jinx game yesterday (loss, 3/8/5), you died at 6:42 to a gank from 
-river. You had no wards placed at that point. This same pattern happened in 
-your Caitlyn game 3 days ago at 7:15.
+Priority #1: Wave management for safety
 
-🎯 Priority #1: Wave management for safety
-
-When your wave is pushing toward enemy tower, you're vulnerable. Instead of 
+When your wave is pushing toward enemy tower, you're vulnerable. Instead of
 walking up for CS, let the wave push back to you.
 
-📝 Exercise: In your next 3 games, focus on one thing - don't walk past the 
-middle of the lane if you don't have a ward in river bush. Track how many 
-times you catch yourself about to break this rule.
+Exercise: In your next 3 games, focus on one thing - don't walk past the
+middle of the lane if you don't have a ward in river bush.
 
 Want me to break down your teamfighting patterns, or focus more on laning?
 ```
@@ -49,14 +52,14 @@ git clone https://github.com/yourusername/lol-ai-coach.git
 cd lol-ai-coach
 
 # Install dependencies
-pip install -r requirements.txt
+pip install -e ".[dev]"
 
 # Set up environment
 cp .env.example .env
 # Edit .env with your API keys
 
 # Run analysis
-python scripts/analyze_player.py "YourName#TAG" --region americas
+python scripts/analyze_player.py "YourName#TAG" --platform na1
 ```
 
 ## Getting API Keys
@@ -72,42 +75,100 @@ python scripts/analyze_player.py "YourName#TAG" --region americas
 2. Create an account and add credits
 3. Generate an API key
 
+## CLI Usage
+
+```bash
+# Basic analysis
+python scripts/analyze_player.py "PlayerName#TAG" --platform br1
+
+# Analyze more matches
+python scripts/analyze_player.py "PlayerName#TAG" --platform na1 --matches 50
+
+# Skip intent selection (direct focus)
+python scripts/analyze_player.py "PlayerName#TAG" --intent laning
+
+# Faster analysis (skip timeline data)
+python scripts/analyze_player.py "PlayerName#TAG" --no-timeline
+
+# Debug mode (verbose logging)
+python scripts/analyze_player.py "PlayerName#TAG" --debug
+```
+
+### Available Intents
+
+| Intent | Focus |
+|--------|-------|
+| `laning` | CS, trading, wave management |
+| `macro` | Rotations, objectives, map awareness |
+| `teamfighting` | Team engagement mechanics |
+| `dying_less` | Survivability and positioning |
+| `climbing` | General rank improvement |
+| `champion_specific` | Master a specific champion |
+| `mental` | Tilt management |
+| `general` | Complete analysis |
+
+## Docker Usage
+
+```bash
+# Build the image
+docker build -t lol-ai-coach .
+
+# Run analysis
+docker run -it --env-file .env lol-ai-coach "PlayerName#TAG" --platform br1
+
+# Run with docker-compose
+docker-compose run coach "PlayerName#TAG" --platform br1
+```
+
 ## Features
 
-### Phase 1 (Current)
-- ✅ Fetch player data by Riot ID
-- ✅ Analyze last 20 matches
-- ✅ Basic pattern detection
-- ✅ AI-generated coaching feedback
-- ✅ CLI interface
+### Core Features
+- Fetch player data by Riot ID
+- Analyze up to 100 recent matches
+- Timeline analysis for detailed death/event tracking
+- AI-generated coaching with Claude
+- Player intent system for focused coaching
+- RAG knowledge base with coaching theory
+- Interactive follow-up conversations
 
-### Phase 2 (In Progress)
-- ⏳ Timeline analysis for detailed insights
-- ⏳ Lane phase breakdown
-- ⏳ Cross-match pattern recognition
-- ⏳ Rank-appropriate benchmarks
-
-### Phase 3 (Planned)
-- 📋 Knowledge base with coaching content
-- 📋 Custom exercise generation
-- 📋 Progress tracking
-
-### Phase 4 (Future)
-- 📋 Web interface
-- 📋 Real-time Overwolf overlay
+### Production Infrastructure
+- Structured logging (JSON for production, colored for dev)
+- Comprehensive error handling with retry logic
+- Input validation and sanitization
+- Centralized configuration management
+- Docker support with multi-stage builds
+- GitHub Actions CI/CD pipeline
+- Pre-commit hooks for code quality
 
 ## Project Structure
 
 ```
 lol-ai-coach/
 ├── src/
-│   ├── api/           # Riot & Claude API clients
-│   ├── analysis/      # Pattern detection
-│   ├── coach/         # AI coaching logic
-│   └── models/        # Data models
-├── knowledge/         # Coaching documents (RAG)
-├── scripts/           # CLI tools
-└── tests/             # Test suite
+│   ├── api/              # Riot API client
+│   │   └── riot.py       # Rate-limited API calls
+│   ├── coach/            # AI coaching logic
+│   │   ├── claude_coach.py   # Claude integration
+│   │   ├── intents.py        # Player intent system
+│   │   └── knowledge.py      # RAG knowledge loader
+│   ├── config.py         # Configuration management
+│   ├── exceptions.py     # Custom exceptions
+│   ├── logging_config.py # Structured logging
+│   └── validation.py     # Input validation
+├── knowledge/            # Coaching documents (RAG)
+│   ├── core_theory.md
+│   ├── fundamentals/
+│   ├── macro/
+│   └── mental/
+├── scripts/
+│   └── analyze_player.py # Main CLI entry point
+├── tests/
+│   ├── unit/
+│   └── integration/
+├── pyproject.toml        # Python packaging & tool config
+├── Dockerfile
+├── docker-compose.yml
+└── .github/workflows/    # CI/CD
 ```
 
 ## Configuration
@@ -116,23 +177,65 @@ lol-ai-coach/
 # .env
 RIOT_API_KEY=RGAPI-xxxxx          # Your Riot API key
 ANTHROPIC_API_KEY=sk-ant-xxxxx    # Your Claude API key
-RIOT_DEFAULT_REGION=americas       # americas, europe, asia, sea
+
+# Optional
+APP_ENV=development               # development, staging, production
+LOG_LEVEL=INFO                    # DEBUG, INFO, WARNING, ERROR
+CLAUDE_MODEL=claude-sonnet-4-20250514  # Claude model to use
+```
+
+## Development
+
+```bash
+# Install with dev dependencies
+pip install -e ".[dev]"
+
+# Run tests
+pytest tests/unit -v
+
+# Run with coverage
+pytest tests/ --cov=src --cov-report=term-missing
+
+# Lint code
+ruff check src/ tests/
+
+# Format code
+black src/ tests/
+
+# Type check
+mypy src/
+
+# Install pre-commit hooks
+pre-commit install
 ```
 
 ## Supported Regions
 
-| Region Code | Routing | Server |
-|-------------|---------|--------|
+| Platform | Routing | Server |
+|----------|---------|--------|
 | na1 | americas | North America |
 | br1 | americas | Brazil |
+| la1 | americas | Latin America North |
+| la2 | americas | Latin America South |
 | euw1 | europe | EU West |
 | eun1 | europe | EU Nordic & East |
+| tr1 | europe | Turkey |
+| ru | europe | Russia |
 | kr | asia | Korea |
 | jp1 | asia | Japan |
+| oc1 | sea | Oceania |
+| ph2 | sea | Philippines |
+| sg2 | sea | Singapore |
+| th2 | sea | Thailand |
+| tw2 | sea | Taiwan |
+| vn2 | sea | Vietnam |
 
 ## Contributing
 
-Contributions welcome! See AGENT.md for technical details and development guidelines.
+Contributions welcome! Please:
+1. Install pre-commit hooks: `pre-commit install`
+2. Run tests before submitting: `pytest tests/`
+3. See AGENT.md for technical details
 
 ## License
 
