@@ -55,8 +55,14 @@ database = [
 redis = [
     "redis>=5.0.0",
 ]
+discord = [
+    "discord.py[voice]>=2.3.0",
+    "openai-whisper>=20231117",
+    "pynacl>=1.5.0",
+    "numpy>=1.24.0",
+]
 all = [
-    "lol-ai-coach[dev,api,database,redis]",
+    "lol-ai-coach[dev,api,database,redis,discord]",
 ]
 
 [project.scripts]

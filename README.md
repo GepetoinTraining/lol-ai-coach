@@ -11,6 +11,8 @@ This is **NOT** another stats tracker. While apps like Blitz, Mobalytics, and Po
 - **Creates personalized drills** to address your issues
 - **Focuses on what you want** with the intent system
 - **Talks to you like a real coach** would
+- **Voice-enabled Discord bot** with in-game overlay missions
+- **Screenshot analysis** to verify your progress
 
 ## Example Interaction
 
@@ -74,6 +76,76 @@ python scripts/analyze_player.py "YourName#TAG" --platform na1
 1. Go to https://console.anthropic.com/
 2. Create an account and add credits
 3. Generate an API key
+
+### Discord Bot Token (for voice coaching)
+1. Go to https://discord.com/developers/applications
+2. Create a new application
+3. Go to "Bot" section and create a bot
+4. Copy the bot token
+5. Enable these Privileged Gateway Intents:
+   - Message Content Intent
+   - Server Members Intent (optional)
+6. Invite bot to your server with OAuth2 URL Generator:
+   - Scopes: `bot`, `applications.commands`
+   - Permissions: `Send Messages`, `Connect`, `Speak`, `Use Voice Activity`
+
+## Discord Bot (Voice Coaching)
+
+The Discord bot provides voice-enabled coaching with missions displayed via Discord's overlay.
+
+### Setup
+
+```bash
+# Install Discord dependencies
+pip install -e ".[discord]"
+
+# Add to your .env
+DISCORD_BOT_TOKEN=your-bot-token
+DISCORD_GUILD_ID=your-server-id  # Optional, for faster command sync
+WHISPER_MODEL=base  # tiny/base/small/medium/large
+
+# Run the bot
+python scripts/run_discord_bot.py
+```
+
+### Usage
+
+1. **Enable Discord Overlay** in Discord settings (User Settings > Game Overlay)
+2. **Join a voice channel** in your Discord server
+3. Use slash commands:
+
+| Command | Description |
+|---------|-------------|
+| `/coach PlayerName#TAG` | Start a coaching session |
+| `/join` | Bot joins your voice channel |
+| `/leave` | Bot leaves voice channel |
+| `/mission` | Show current mission |
+| `/check` | Upload screenshot to verify progress |
+| `/complete` | Mark mission as complete |
+
+### Voice Commands
+
+While in voice channel, you can say:
+- "What's my mission?"
+- "Check my progress"
+- "Give me a new mission"
+- "Mission complete"
+- "How's my CS?"
+- Any coaching question!
+
+### How It Works
+
+```
+You speak → Whisper transcribes → Coach understands
+                    ↓
+         Claude generates mission
+                    ↓
+      Discord text (shows in overlay)
+                    ↓
+    You upload screenshot → Claude Vision analyzes
+                    ↓
+        Progress feedback in overlay
+```
 
 ## CLI Usage
 
